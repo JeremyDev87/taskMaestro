@@ -1,0 +1,6 @@
+.omc/
+.DS_Store
+*.swp
+*.swo
+*~
+.taskmaestro/

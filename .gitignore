@@ -4,3 +4,10 @@
 *.swo
 *~
 .taskmaestro/
+.claude
+.mcp.json
+
+# Codingbuddy (local workspace)
+codingbuddy.config.json
+docs/codingbuddy/
+.codingbuddy/

@@ -94,6 +94,43 @@ Include this instruction in every worker task directive:
 
 ---
 
+## Shell Script Safety Rules
+
+### Array Indexing Ban
+
+Array indexing behaves differently between bash and zsh, causing silent bugs:
+
+```bash
+# ❌ BANNED — index mismatch between shells
+# bash: arr[0] is first element
+# zsh:  arr[1] is first element (0-indexed requires setopt)
+PANES=(1 2 3)
+echo "${PANES[0]}"  # Different result in bash vs zsh!
+
+# ✅ REQUIRED — explicit key:value mapping
+PANE_1_TASK="implement API"
+PANE_2_TASK="write tests"
+# Or use associative arrays with explicit keys
+```
+
+**Rule:** Never use numeric array indexing in shell scripts. Use explicit variable names or associative arrays with string keys.
+
+---
+
+## Session Management
+
+### Compact Cadence
+
+For long-running orchestration sessions, context can grow large. Follow these guidelines:
+
+- **Watch mode** produces periodic status reports — keep them concise (summary table only)
+- **Conductor decisions** should be logged to `~/.claude/taskmaestro-state.json`, not kept in conversation context
+- When the conductor's context gets large, summarize completed waves and focus on the current wave
+- CronCreate jobs are tied to the current Claude Code session and auto-expire after 7 days
+- If the session ends or expires, watch mode stops — run `/taskmaestro watch` again to restart
+
+---
+
 ## Subcommand: start
 
 `/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>]`

@@ -445,18 +445,48 @@ done
 - 도구 실행 중 (스피너, 코드 출력 진행 중) → "working"
 - 에러 패턴 (`Error`, `error`, `failed`, `FAIL`) → "error"
 
-### Step 4: 요약 보고
+### Step 4: Cross-Validation
 
-상태 파일의 task 정보와 결합하여 테이블로 출력:
+RESULT.json and capture-pane MUST agree. When they conflict, flag as uncertain:
+
+| RESULT.json | Pane State | Verdict |
+|-------------|------------|---------|
+| `success` | idle (❯) | ✅ Confirmed done |
+| `success` | active | ⚠️ UNCERTAIN — investigate |
+| absent | idle | Needs nudge |
+| absent | active (tokens flowing) | 🔄 Confirmed working |
+| `failure`/`error` | any | ❌ Failed/Error |
+
+### Step 5: Evidence-Based Status Report
+
+Every status line MUST include parenthetical evidence:
+
 ```
-TaskMaestro 상태 (workspace-1):
+TaskMaestro Status (workspace-1):
 
-  패널 1: working - "API 엔드포인트 구현"
-  패널 2: idle - 작업 대기 중
-  패널 3: error - "모듈을 찾을 수 없음"
+  Pane 1: ✅ done - "API endpoints" → PR #42 (RESULT.json: success, pane idle ✓)
+  Pane 2: 🔄 working - "Auth feature" (active: ✽ Implementing… · ↓ 5.3k tokens)
+  Pane 3: ⚠️ uncertain - "Cache layer" (RESULT.json exists BUT pane still active)
+  Pane 4: ❌ error - "DB migration" (error in last 30 lines: "ModuleNotFoundError")
+  Pane 5: ⏸️ idle - no task assigned (❯ prompt visible, no RESULT.json)
 ```
 
-에러 상태인 패널이 있으면 해당 패널의 캡처 내용 마지막 10줄도 함께 표시.
+**Status icons:**
+
+| Status | Icon | Description |
+|--------|------|-------------|
+| done (RESULT.json success + pane idle) | ✅ | Confirmed complete |
+| working (pane active, tokens flowing) | 🔄 | Confirmed working |
+| idle (no task, ❯ prompt) | ⏸️ | Awaiting assignment |
+| error/failure | ❌ | Task failed |
+| uncertain (RESULT.json + pane active) | ⚠️ | Cross-validation conflict |
+
+**Rules:**
+- Never report bare ✅ without evidence
+- Active spinner + token flow = confirmed working
+- "thinking" alone ≠ working — check token count changes between cycles
+- Error scan depth: **30+ lines** (not just last 8)
+- RESULT.json + pane active = UNCERTAIN (investigate before reporting done)
 
 ---
 

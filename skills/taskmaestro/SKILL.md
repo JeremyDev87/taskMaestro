@@ -213,6 +213,43 @@ for PANE_IDX in $WORKER_PANES; do
 done
 ```
 
+### Step 4.5: Worker Pre-Flight Verification
+
+Before launching Claude Code, verify each worktree is in a clean, ready state:
+
+```bash
+for PANE_IDX in $WORKER_PANES; do
+  WT_PATH="$DIR/.taskmaestro/wt-$PANE_IDX"
+
+  # 1. Remove stale artifacts from previous waves
+  rm -f "$WT_PATH/RESULT.json" "$WT_PATH/TASK.md"
+
+  # 2. Copy permission presets (prevents permission prompts blocking workers)
+  if [ -f "$REPO/.claude/settings.local.json" ]; then
+    mkdir -p "$WT_PATH/.claude"
+    cp "$REPO/.claude/settings.local.json" "$WT_PATH/.claude/settings.local.json"
+  fi
+
+  # 3. Install dependencies (CRITICAL — without this, local CI checks fail)
+  echo "Installing dependencies in wt-$PANE_IDX..."
+  (cd "$WT_PATH" && yarn install --immutable 2>/dev/null) || \
+    echo "WARNING: yarn install failed in wt-$PANE_IDX"
+
+  # 4. Verify git status clean
+  if ! git -C "$WT_PATH" diff --quiet 2>/dev/null; then
+    echo "WARNING: wt-$PANE_IDX has uncommitted changes"
+  fi
+done
+```
+
+This prevents:
+- Stale `RESULT.json` from previous waves being detected as "completed"
+- **Workers unable to run local CI checks** due to missing `node_modules` (root cause of repeated CI failures in worktrees)
+- Permission prompt interruptions blocking worker progress
+- Dirty worktree state causing unexpected behavior
+
+> **Note:** The dependency install command (`yarn install`) should match your project's package manager. For Go projects use `go mod download`, for Python use `pip install -e .`, etc.
+
 ### Step 5: 각 패널에 Claude Code 실행
 
 ```bash

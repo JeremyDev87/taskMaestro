@@ -506,9 +506,41 @@ done
 3. `watch_cron_id`를 null로 업데이트
 4. 보고: "Watch 모드를 중지했습니다."
 
+### Auto-Nudge Protocol
+
+When a pane is detected as idle (❯ prompt visible) but its task status is "working",
+the watch loop automatically prods the worker back into action using escalating levels:
+
+| Nudge # | Action | Message |
+|---------|--------|---------|
+| 1 | Gentle continue | `send-keys "continue" Enter` |
+| 2 | Specific continue | `send-keys "continue with the next incomplete task" Enter` |
+| 3+ | Explicit instruction | Send full task context with specific next step |
+
+Implementation in the watch cron prompt:
+
+```
+For each pane where status == "working":
+  Check if idle (❯ prompt visible via capture-pane)
+  If idle:
+    nudge_count[pane] += 1
+    if nudge_count <= 1:
+      send-keys "continue" Enter
+    elif nudge_count == 2:
+      send-keys "continue with the next incomplete task" Enter
+    else:
+      send-keys with explicit instruction including task context from state file
+    Report: "Pane N: IDLE → auto-nudged (#count)"
+  Else:
+    nudge_count[pane] = 0  # Reset on active detection
+```
+
+**Stall detection:** A pane is considered stalled if idle for 3+ consecutive watch cycles (90s+).
+After 3 nudges with no response, report to user for manual intervention.
+
 ### 제한 사항
 
-CronCreate job은 현재 Claude Code 세션에 종속되며, 3일 후 자동 만료된다.
+CronCreate job은 현재 Claude Code 세션에 종속되며, 7일 후 자동 만료된다.
 세션이 종료되거나 만료 시 watch도 중단된다. 재시작하려면 `/taskmaestro watch`를 다시 실행한다.
 
 ---

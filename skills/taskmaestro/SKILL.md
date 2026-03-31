@@ -224,11 +224,55 @@ cat ~/.claude/taskmaestro-state.json
 소켓/세션/윈도우 정보를 가져온다.
 패널 번호가 워커 패널 목록에 포함되는지 검증한다. 지휘자 패널이거나 존재하지 않는 패널이면 에러 출력 후 중단.
 
-### Step 2: 작업 전송
+### Step 2: 작업 전송 (3-tier context delivery)
 
+The conductor uses a 3-tier fallback chain to deliver task context to workers,
+solving the problem of `send-keys` truncating long prompts:
+
+**Tier 1 (preferred): TASK.md file**
+
+Write the full task directive to the worker's worktree, then send a short prompt:
+
+```bash
+# Write TASK.md to worktree root
+cat > "$REPO/.taskmaestro/wt-$PANE/TASK.md" << 'TASKEOF'
+# Task: <task description>
+
+<full task context, acceptance criteria, file list, etc.>
+
+---
+[MANDATORY PRE-PUSH VERIFICATION]
+Before pushing, run and pass ALL checks:
+1. yarn prettier --write .
+2. yarn lint --fix
+3. yarn type-check
+4. yarn test
+
+[COMPLETION PROTOCOL]
+When done, write RESULT.json to the worktree root with status/issue/pr_number/etc.
+TASKEOF
+
+# Send short prompt referencing TASK.md
+tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" \
+  "Read TASK.md in the current directory and execute the task described in it. Follow ALL instructions including pre-push verification and completion protocol." Enter
+```
+
+**Tier 2 (fallback): GitHub issue reference**
+
+When the task has a corresponding GitHub issue:
+```bash
+tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" \
+  "Read the issue with gh issue view <NUMBER> and implement it. Write RESULT.json when done." Enter
+```
+
+**Tier 3 (last resort): Inline prompt**
+
+For short, simple tasks that fit in a single send-keys:
 ```bash
 tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" "<작업 지시>" Enter
 ```
+
+> **Note:** TASK.md is an ephemeral artifact — it must NEVER be committed to git.
 
 ### Step 3: 상태 파일 업데이트
 

@@ -43,6 +43,57 @@ MY_PANE=$(tmux display-message -p '#{pane_index}')
 
 ---
 
+## Worker Completion Signaling (RESULT.json)
+
+Workers write a `RESULT.json` file to their worktree root upon task completion,
+providing a structured and reliable signal to the conductor. This file is the
+**primary detection mechanism** in watch mode; `capture-pane` serves only as a fallback.
+
+### RESULT.json Schema
+
+```json
+{
+  "status": "success | failure | error",
+  "issue": "#123",
+  "pr_number": 42,
+  "pr_url": "https://github.com/org/repo/pull/42",
+  "timestamp": "2026-03-22T01:13:00.000Z",
+  "cost": "$0.45",
+  "error": null
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `status` | `"success" \| "failure" \| "error"` | ✅ | `success`: PR created, `failure`: task failed (tests, build, etc.), `error`: unexpected crash |
+| `issue` | `string \| null` | ❌ | Related issue number (e.g. `"#123"`) |
+| `pr_number` | `number \| null` | ❌ | Created PR number |
+| `pr_url` | `string \| null` | ❌ | Created PR URL |
+| `timestamp` | `string` | ✅ | ISO 8601 completion time |
+| `cost` | `string \| null` | ❌ | Session cost estimate (e.g. `"$0.45"`) |
+| `error` | `string \| null` | ❌ | Error message (when `status` is `"error"`) |
+
+### File Path Rules
+
+- Location: `<repo>/.taskmaestro/wt-<N>/RESULT.json` (each worker's worktree root)
+- Workers write this file **just before session end** (after commit/PR creation)
+- The conductor detects worker completion by checking for this file's existence
+- **RESULT.json must NEVER be committed to git** — it is an ephemeral per-worktree artifact
+
+### 2-Tier Detection Strategy
+
+1. **Primary**: Check `RESULT.json` in each worktree — fast, structured, reliable
+2. **Fallback**: `capture-pane` prompt-pattern matching — only when no RESULT.json exists
+
+### Worker Completion Protocol
+
+Include this instruction in every worker task directive:
+
+> When your task is complete (PR created or error encountered), write a `RESULT.json`
+> file to the worktree root with the appropriate status and fields.
+
+---
+
 ## Subcommand: start
 
 `/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>]`
@@ -283,14 +334,30 @@ tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" "<텍스트>" Ente
 cat ~/.claude/taskmaestro-state.json
 ```
 
-### Step 2: 각 패널 화면 캡처
+### Step 2: RESULT.json 확인 (1차 감지)
 
-각 워커 패널에 대해 실행:
+각 워커 패널의 worktree에서 RESULT.json 존재 여부를 먼저 확인한다:
+
 ```bash
-tmux -L "$SOCKET_NAME" capture-pane -t "$SESSION:$WIN_IDX.$PANE_IDX" -p -S -30 | tail -15
+for PANE_IDX in $WORKER_PANES; do
+  RESULT_FILE="$REPO/.taskmaestro/wt-$PANE_IDX/RESULT.json"
+  if [ -f "$RESULT_FILE" ]; then
+    STATUS=$(cat "$RESULT_FILE" | jq -r '.status')
+    PR_NUMBER=$(cat "$RESULT_FILE" | jq -r '.pr_number // empty')
+    # → status 값에 따라 적절한 상태 아이콘과 메시지 표시
+  fi
+done
 ```
 
-### Step 3: 상태 판단
+### Step 3: capture-pane fallback (2차 감지)
+
+RESULT.json이 없는 패널에 대해서만 capture-pane으로 상태를 확인한다:
+
+```bash
+for PANE_IDX in $NO_RESULT_PANES; do
+  tmux -L "$SOCKET_NAME" capture-pane -t "$SESSION:$WIN_IDX.$PANE_IDX" -p -S -30 | tail -15
+done
+```
 
 캡처된 내용을 분석:
 - 마지막 줄에 Claude Code 프롬프트 (`❯` 또는 `>` 로 시작하는 입력 대기) → "idle"
@@ -318,11 +385,36 @@ TaskMaestro 상태 (workspace-1):
 
 주기적 감시 모드를 토글한다 (시작/중지).
 
+### Detection Strategy (2-tier)
+
+The watch cron prompt uses a 2-tier detection strategy:
+
+```
+# Tier 1: Check RESULT.json in each worktree (fast, structured)
+for PANE_IDX in $WORKER_PANES; do
+  RESULT_FILE="$REPO/.taskmaestro/wt-$PANE_IDX/RESULT.json"
+  if [ -f "$RESULT_FILE" ]; then
+    # Parse status and report
+    STATUS=$(jq -r '.status' "$RESULT_FILE")
+    case "$STATUS" in
+      success) report "Pane $PANE_IDX: ✅ done" ;;
+      failure) report "Pane $PANE_IDX: ❌ failed" ;;
+      error)   report "Pane $PANE_IDX: ❌ error" ;;
+    esac
+  fi
+done
+
+# Tier 2: capture-pane fallback for panes without RESULT.json
+for PANE_IDX in $NO_RESULT_PANES; do
+  tmux capture-pane ... | analyze idle/working/error
+done
+```
+
 ### 시작 (watch_cron_id가 null인 경우)
 
 1. 상태 파일에서 정보 로드
 2. CronCreate로 30초 주기 cron job 생성:
-   - 프롬프트: 각 워커 패널의 상태를 capture-pane으로 확인하고, 에러 상태 패널이 있으면 사용자에게 알린다. Claude Code가 비정상 종료된 패널이 있으면 재시작 여부를 사용자에게 질문한다.
+   - 프롬프트: 먼저 각 워커의 RESULT.json을 확인하고, 없는 패널에 대해서만 capture-pane으로 상태 확인. 에러 상태 패널이 있으면 사용자에게 알린다. Claude Code가 비정상 종료된 패널이 있으면 재시작 여부를 사용자에게 질문한다.
 3. cron job ID를 상태 파일의 `watch_cron_id`에 기록
 4. 보고: "Watch 모드를 시작합니다 (30초 주기). 중지하려면 `/taskmaestro watch`를 다시 실행하세요."
 

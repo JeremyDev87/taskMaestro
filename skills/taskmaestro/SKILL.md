@@ -53,25 +53,29 @@ providing a structured and reliable signal to the conductor. This file is the
 
 ```json
 {
-  "status": "success | failure | error",
+  "status": "success | failure | error | review_pending | review_addressed | approved",
   "issue": "#123",
   "pr_number": 42,
   "pr_url": "https://github.com/org/repo/pull/42",
   "timestamp": "2026-03-22T01:13:00.000Z",
   "cost": "$0.45",
-  "error": null
+  "error": null,
+  "review_cycle": 0,
+  "review_comments": []
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | `"success" \| "failure" \| "error"` | ✅ | `success`: PR created, `failure`: task failed (tests, build, etc.), `error`: unexpected crash |
+| `status` | `string` | ✅ | `success`: PR created (review cycle starts), `failure`: task failed, `error`: unexpected crash, `review_pending`: review comments posted (awaiting worker), `review_addressed`: worker addressed review (awaiting re-review), `approved`: final approval (truly done) |
 | `issue` | `string \| null` | ❌ | Related issue number (e.g. `"#123"`) |
 | `pr_number` | `number \| null` | ❌ | Created PR number |
 | `pr_url` | `string \| null` | ❌ | Created PR URL |
 | `timestamp` | `string` | ✅ | ISO 8601 completion time |
 | `cost` | `string \| null` | ❌ | Session cost estimate (e.g. `"$0.45"`) |
 | `error` | `string \| null` | ❌ | Error message (when `status` is `"error"`) |
+| `review_cycle` | `number` | ❌ | Current review cycle count (default: 0) |
+| `review_comments` | `string[]` | ❌ | Summary of review comments from conductor |
 
 ### File Path Rules
 
@@ -91,6 +95,154 @@ Include this instruction in every worker task directive:
 
 > When your task is complete (PR created or error encountered), write a `RESULT.json`
 > file to the worktree root with the appropriate status and fields.
+
+---
+
+## Review Cycle Protocol
+
+Workers are NOT considered "done" when a PR is created. They must go through a review loop
+until approved. `status: "approved"` is the only true completion state.
+
+### Status Flow
+
+```
+success → review_pending → review_addressed → approved
+```
+
+| Status | Meaning |
+|--------|---------|
+| `success` | PR created, review cycle starts |
+| `review_pending` | Review comments posted, awaiting worker response |
+| `review_addressed` | Worker addressed review, awaiting re-review |
+| `approved` | Final approval — truly done ✅ |
+
+### Trigger
+
+When watch mode detects RESULT.json:
+- `status: "success"` → **start review cycle** (NOT done)
+- `status: "failure"` / `"error"` → report to user (existing behavior)
+- `status: "review_pending"` → awaiting worker response (conductor waits)
+- `status: "review_addressed"` → start re-review
+- `status: "approved"` → truly done ✅
+
+### Review Routing
+
+When `status: "success"` or `status: "review_addressed"` is detected:
+
+1. Check state file for `review_pane`
+2. If `review_pane` exists → delegate to **Review Agent** (see below)
+3. If no `review_pane` → **Conductor Fallback Review**
+
+### Conductor Fallback Review
+
+When no dedicated review pane is configured, the conductor reviews directly:
+
+1. **Read PR diff**
+   ```bash
+   gh pr diff <PR_NUMBER>
+   ```
+
+2. **Generate checklist** (optional — if a checklist tool is available, use it for domain-specific checks based on changed files)
+
+3. **Post review comment**
+   ```bash
+   gh pr review <PR_NUMBER> --comment --body "<review comments>"
+   ```
+
+4. **Update RESULT.json** to `review_pending`:
+   ```json
+   { "status": "review_pending", "review_cycle": 1, "review_comments": ["unused import", "missing error handling"] }
+   ```
+
+5. **Instruct worker to address comments**
+   ```bash
+   tmux send-keys -t "$PANE" \
+     "PR #<N> has review comments. Run gh pr view <N> --comments, address each comment, push fixes, then update RESULT.json status to review_addressed." Enter
+   ```
+
+6. **Worker responds**: fixes code → pushes → updates RESULT.json to `review_addressed`
+
+7. **Re-review**: Conductor detects `review_addressed`, reads diff again.
+   - Issues resolved → **approve** (Step 8)
+   - Issues remain → repeat from Step 3
+
+8. **Final approval**
+   ```bash
+   gh pr review <PR_NUMBER> --approve --body "LGTM - all review comments addressed"
+   # If own PR (can't self-approve): use --comment instead
+   gh pr review <PR_NUMBER> --comment --body "✅ Review complete - all comments addressed"
+   ```
+   Update RESULT.json: `status: "approved"`
+
+### Max Review Cycles
+
+- **Maximum 3 review cycles** to prevent infinite loops
+- After 3 cycles, report to user:
+  ```
+  ⚠️ Pane N: 3 review cycles completed, unresolved issues remain.
+  PR: #<NUMBER>
+  Unresolved comments: [list]
+  Manual intervention required.
+  ```
+
+### Quality Criteria for Approval
+
+- All CI checks passing (`gh pr checks <PR_NUMBER>`)
+- No unused variables/imports
+- No unhandled errors in new code
+- Test coverage maintained
+
+---
+
+## Review Agent Protocol
+
+When `--review-pane` is enabled (default), the last worker pane is allocated as a
+dedicated review agent, separating code review concerns from the conductor.
+
+### Review Agent Checklist (MANDATORY ORDER)
+
+The review agent MUST follow this 6-step checklist for every PR:
+
+1. **CI Gate** — `gh pr checks <PR_NUMBER>` must all pass before reviewing
+2. **Local Verification** — Checkout PR branch, run build + tests locally
+3. **Code Quality Scan** — Check for unused imports, dead code, complexity
+4. **Spec Compliance** — Does the PR match the issue requirements?
+5. **Test Coverage** — Are new code paths covered by tests?
+6. **Structured Review Comment** — Post findings via `gh pr review`
+
+### Review Agent RESULT.json
+
+The review agent writes its own RESULT.json with a `review_result` field:
+
+```json
+{
+  "status": "success",
+  "review_result": "approve | changes_requested",
+  "pr_number": 42,
+  "review_comments": ["unused import in line 15", "missing test for error case"],
+  "timestamp": "2026-03-28T16:00:00.000Z"
+}
+```
+
+### Conductor Handling of Review Agent Result
+
+When watch detects the review agent's RESULT.json:
+
+- `review_result: "approve"` → Update worker's RESULT.json to `approved`, report done
+- `review_result: "changes_requested"` → Forward comments to worker pane, update to `review_pending`
+
+### Review Cycle State in taskmaestro-state.json
+
+```json
+{
+  "panes": {
+    "1": { "task": "API endpoints", "status": "review_pending", "role": "worker", "review_cycle": 1 },
+    "2": { "task": "Auth feature", "status": "working", "role": "worker" },
+    "3": { "task": null, "status": "idle", "role": "reviewer" }
+  },
+  "review_pane": "3"
+}
+```
 
 ---
 
@@ -133,7 +285,7 @@ For long-running orchestration sessions, context can grow large. Follow these gu
 
 ## Subcommand: start
 
-`/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>]`
+`/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>] [--review-pane | --no-review-pane]`
 
 현재 세션의 기존 패널들에 worktree + Claude Code를 세팅한다.
 
@@ -142,6 +294,8 @@ For long-running orchestration sessions, context can grow large. Follow these gu
 - `--repo`: 대상 레포 경로 (기본값: 현재 작업 디렉토리)
 - `--base`: 베이스 브랜치 (기본값: 현재 브랜치)
 - `--panes`: 사용할 패널 번호 목록 (기본값: 지휘자 패널을 제외한 모든 패널)
+- `--review-pane`: 마지막 패널을 리뷰 전용 에이전트로 할당 (기본값: enabled)
+- `--no-review-pane`: 리뷰 패널 비활성화 (모든 패널이 워커)
 
 ### Step 2: 사전 검증
 
@@ -301,10 +455,11 @@ done
   "base_branch": "브랜치",
   "created_at": "ISO timestamp",
   "watch_cron_id": null,
+  "review_pane": 3,
   "panes": [
-    {"index": 1, "worktree": "절대경로/.taskmaestro/wt-1", "branch": "taskmaestro/ts/pane-1", "task": null, "status": "idle"},
-    {"index": 2, "worktree": "절대경로/.taskmaestro/wt-2", "branch": "taskmaestro/ts/pane-2", "task": null, "status": "idle"},
-    {"index": 3, "worktree": "절대경로/.taskmaestro/wt-3", "branch": "taskmaestro/ts/pane-3", "task": null, "status": "idle"}
+    {"index": 1, "worktree": "절대경로/.taskmaestro/wt-1", "branch": "taskmaestro/ts/pane-1", "task": null, "status": "idle", "role": "worker"},
+    {"index": 2, "worktree": "절대경로/.taskmaestro/wt-2", "branch": "taskmaestro/ts/pane-2", "task": null, "status": "idle", "role": "worker"},
+    {"index": 3, "worktree": "절대경로/.taskmaestro/wt-3", "branch": "taskmaestro/ts/pane-3", "task": null, "status": "idle", "role": "reviewer"}
   ]
 }
 ```

@@ -131,6 +131,50 @@ For long-running orchestration sessions, context can grow large. Follow these gu
 
 ---
 
+## Merge Policy (MANDATORY)
+
+The conductor must NEVER merge PRs directly. Always delegate merge to the user.
+
+**Prohibited actions:**
+- `gh pr merge` — conductor must not execute this
+- Auto-merge enablement — conductor must not enable auto-merge
+
+**Allowed actions:**
+- `gh pr review --approve` — approve after review passes
+- Report PR status to user with merge recommendation
+- User decides when and how to merge (squash, rebase, merge commit)
+
+**Rationale:** Merging is an irreversible action that affects the main branch. The conductor
+orchestrates work but does not own the merge decision. This prevents accidental merges of
+incomplete or conflicting PRs, especially during multi-wave parallel execution.
+
+---
+
+## Wave Analysis: Shared File Prediction
+
+**Iron Rule:** Issues that modify the same file MUST NOT run in the same wave.
+
+Before assigning issues to parallel workers, the conductor must analyze potential file overlap:
+
+1. **Read each issue body** — extract mentioned file paths, component names, module references
+2. **Build overlap matrix** — identify shared files between issue pairs
+3. **Group into waves** — issues with zero file overlap can run in parallel (same wave), overlapping issues must be in different waves
+
+```
+Example:
+  Issue A: modifies src/auth/login.ts, src/auth/types.ts
+  Issue B: modifies src/api/users.ts
+  Issue C: modifies src/auth/login.ts, src/api/middleware.ts
+
+  Wave 1: [A, B]  — no overlap
+  Wave 2: [C]     — overlaps with A on login.ts
+```
+
+**Why:** Parallel workers in separate worktrees create independent branches. If two workers
+modify the same file, their PRs will conflict at merge time, requiring manual resolution.
+
+---
+
 ## Subcommand: start
 
 `/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>]`

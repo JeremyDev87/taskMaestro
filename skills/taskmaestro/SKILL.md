@@ -396,20 +396,74 @@ fi
 
 > **최소 패널 요구:** `--review-pane` 사용 시 지휘자 + 워커 1개 + 리뷰어 1개 = 최소 3개 패널이 필요하다.
 
-**워커 패널이 없는 경우:** 지휘자 패널만 존재하면, 첫 번째 숫자 인수(기본값 3)만큼 새 패널을 생성한다:
+**워커 패널이 없는 경우:** 지휘자 패널만 존재하면, 첫 번째 숫자 인수(기본값 4)만큼 새 패널을 **conductor-bottom grid layout**으로 생성한다.
+
+지원하는 워커 수: **2, 4, 6, 8, 12, 16, 20**. 이외의 수를 요청하면 에러를 출력한다.
+
+**레이아웃 구조:**
+```
+┌──────┬──────┬──────┬──────┐
+│  W1  │  W2  │  W3  │  W4  │  Worker Grid (상단 80%)
+├──────┼──────┼──────┼──────┤
+│  W5  │  W6  │  W7  │  W8  │
+├──────────────────────────────┤
+│         Conductor            │  지휘자 (하단 20%)
+└──────────────────────────────┘
+```
 
 ```bash
-PANE_COUNT=${1:-3}  # 기본 3개
+PANE_COUNT=${1:-4}
 DIR=$(cd "$REPO" && pwd)
 
-for ((i = 0; i < PANE_COUNT; i++)); do
-  tmux -L "$SOCKET_NAME" split-window -t "$SESSION:$WIN_IDX" -c "$DIR"
-  tmux -L "$SOCKET_NAME" select-layout -t "$SESSION:$WIN_IDX" tiled
+# Step 0: 그리드 매핑
+case $PANE_COUNT in
+  2)  ROWS=1; COLS=2 ;;
+  4)  ROWS=2; COLS=2 ;;
+  6)  ROWS=2; COLS=3 ;;
+  8)  ROWS=2; COLS=4 ;;
+  12) ROWS=3; COLS=4 ;;
+  16) ROWS=4; COLS=4 ;;
+  20) ROWS=4; COLS=5 ;;
+  *)  echo "❌ 지원하지 않는 워커 수: $PANE_COUNT (2,4,6,8,12,16,20만 가능)"; return 1 ;;
+esac
+
+# Step 1: 지휘자 위에 워커 영역 생성 (80% / 20%)
+WORKER_AREA=$(tmux -L "$SOCKET_NAME" split-window -b -v -p 80 -t "$SESSION:$WIN_IDX.$MY_PANE" -c "$DIR" -P -F '#{pane_id}')
+
+# Step 2: 워커 영역을 ROWS개 행으로 분할
+ROW_PANES=("$WORKER_AREA")
+CURRENT="$WORKER_AREA"
+for ((r = 1; r < ROWS; r++)); do
+  SPLIT_PCT=$((100 - 100 / (ROWS - r + 1)))
+  NEW_PANE=$(tmux -L "$SOCKET_NAME" split-window -v -p $SPLIT_PCT -t "$CURRENT" -c "$DIR" -P -F '#{pane_id}')
+  ROW_PANES+=("$NEW_PANE")
+  CURRENT="$NEW_PANE"
+done
+
+# Step 3: 각 행을 COLS개 열로 분할
+for ROW_PANE in "${ROW_PANES[@]}"; do
+  CURRENT="$ROW_PANE"
+  for ((c = 1; c < COLS; c++)); do
+    SPLIT_PCT=$((100 - 100 / (COLS - c + 1)))
+    CURRENT=$(tmux -L "$SOCKET_NAME" split-window -h -p $SPLIT_PCT -t "$CURRENT" -c "$DIR" -P -F '#{pane_id}')
+  done
 done
 
 # 지휘자 패널로 포커스 복귀
 tmux -L "$SOCKET_NAME" select-pane -t "$SESSION:$WIN_IDX.$MY_PANE"
 ```
+
+**그리드 매핑 참조:**
+
+| 워커 수 | 그리드 | 패널 최소 폭(200col 기준) |
+|---------|--------|--------------------------|
+| 2 | 1×2 | 100 |
+| 4 | 2×2 | 100 |
+| 6 | 2×3 | 66 |
+| 8 | 2×4 | 50 |
+| 12 | 3×4 | 50 |
+| 16 | 4×4 | 50 |
+| 20 | 4×5 | 40 |
 
 생성 후 다시 패널 목록을 조회하여 워커 패널을 결정한다.
 

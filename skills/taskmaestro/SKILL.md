@@ -16,7 +16,7 @@ user-invocable: true
 
 `$ARGUMENTS`를 파싱하여 서브커맨드와 인수를 분리한다:
 
-- `start [--repo <path>] [--base <branch>] [--panes <1,2,3>]`
+- `start [--repo <path>] [--base <branch>] [--panes <1,2,3>] [--review-pane] [--no-review-pane]`
 - `assign <패널번호> "<작업 지시>"`
 - `status`
 - `watch`
@@ -45,18 +45,17 @@ MY_PANE=$(tmux display-message -p '#{pane_index}')
 
 ## Worker Completion Signaling (RESULT.json)
 
-Workers write a `RESULT.json` file to their worktree root upon task completion,
-providing a structured and reliable signal to the conductor. This file is the
-**primary detection mechanism** in watch mode; `capture-pane` serves only as a fallback.
+워커가 작업을 완료하면 `.taskmaestro/wt-N/RESULT.json` 파일을 생성하여 지휘자에게 결과를 알린다.
+이 파일은 watch 모드의 **1차 감지 수단**이며, capture-pane은 fallback으로만 사용한다.
 
-### RESULT.json Schema
+### RESULT.json 스키마
 
 ```json
 {
   "status": "success | failure | error | review_pending | review_addressed | approved",
-  "issue": "#123",
-  "pr_number": 42,
-  "pr_url": "https://github.com/org/repo/pull/42",
+  "issue": "#767",
+  "pr_number": 123,
+  "pr_url": "https://github.com/org/repo/pull/123",
   "timestamp": "2026-03-22T01:13:00.000Z",
   "cost": "$0.45",
   "error": null,
@@ -65,184 +64,236 @@ providing a structured and reliable signal to the conductor. This file is the
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `status` | `string` | ✅ | `success`: PR created (review cycle starts), `failure`: task failed, `error`: unexpected crash, `review_pending`: review comments posted (awaiting worker), `review_addressed`: worker addressed review (awaiting re-review), `approved`: final approval (truly done) |
-| `issue` | `string \| null` | ❌ | Related issue number (e.g. `"#123"`) |
-| `pr_number` | `number \| null` | ❌ | Created PR number |
-| `pr_url` | `string \| null` | ❌ | Created PR URL |
-| `timestamp` | `string` | ✅ | ISO 8601 completion time |
-| `cost` | `string \| null` | ❌ | Session cost estimate (e.g. `"$0.45"`) |
-| `error` | `string \| null` | ❌ | Error message (when `status` is `"error"`) |
-| `review_cycle` | `number` | ❌ | Current review cycle count (default: 0) |
-| `review_comments` | `string[]` | ❌ | Summary of review comments from conductor |
+| 필드 | 타입 | 필수 | 설명 |
+|------|------|------|------|
+| `status` | `"success" \| "failure" \| "error" \| "review_pending" \| "review_addressed" \| "approved"` | ✅ | 작업 결과. `success`: PR 생성 완료 (리뷰 대기), `failure`: 작업 실패 (테스트 실패 등), `error`: 예기치 못한 오류, `review_pending`: 지휘자 리뷰 코멘트 작성 완료 (워커 응답 대기), `review_addressed`: 워커가 리뷰 반영 완료 (재리뷰 대기), `approved`: 지휘자 최종 승인 (진짜 완료) |
+| `issue` | `string \| null` | ❌ | 관련 이슈 번호 (예: `"#767"`) |
+| `pr_number` | `number \| null` | ❌ | 생성된 PR 번호 |
+| `pr_url` | `string \| null` | ❌ | 생성된 PR URL |
+| `timestamp` | `string` | ✅ | ISO 8601 완료 시각 |
+| `cost` | `string \| null` | ❌ | 세션 비용 (예: `"$0.45"`) |
+| `error` | `string \| null` | ❌ | 에러 메시지 (`status`가 `"error"`일 때) |
+| `review_cycle` | `number` | ❌ | 현재 리뷰 사이클 횟수 (기본값: 0) |
+| `review_comments` | `string[]` | ❌ | 지휘자가 남긴 리뷰 코멘트 요약 목록 |
 
-### File Path Rules
+### 파일 경로 규칙
 
-- Location: `<repo>/.taskmaestro/wt-<N>/RESULT.json` (each worker's worktree root)
-- Workers write this file **just before session end** (after commit/PR creation)
-- The conductor detects worker completion by checking for this file's existence
-- **RESULT.json must NEVER be committed to git** — it is an ephemeral per-worktree artifact
+- 위치: `<repo>/.taskmaestro/wt-<N>/RESULT.json` (각 워커의 worktree 루트)
+- 워커는 작업 완료 **직전** (커밋/PR 생성 후, 세션 종료 전)에 이 파일을 작성한다
+- 지휘자는 이 파일의 존재 여부로 워커 완료를 감지한다
 
-### 2-Tier Detection Strategy
-
-1. **Primary**: Check `RESULT.json` in each worktree — fast, structured, reliable
-2. **Fallback**: `capture-pane` prompt-pattern matching — only when no RESULT.json exists
-
-### Worker Completion Protocol
-
-Include this instruction in every worker task directive:
-
-> When your task is complete (PR created or error encountered), write a `RESULT.json`
-> file to the worktree root with the appropriate status and fields.
-
----
 
 ## Review Cycle Protocol
 
-Workers are NOT considered "done" when a PR is created. They must go through a review loop
-until approved. `status: "approved"` is the only true completion state.
+워커가 `RESULT.json`에 `status: "success"`를 기록하면 리뷰 사이클이 시작되고, `status: "approved"`가 될 때까지 반복된다. 승인이 "진짜 완료"다.
 
-### Status Flow
+### 리뷰 프로토콜 (7단계)
 
+모든 리뷰어(지휘자 또는 리뷰 에이전트)는 아래 단계를 **순서대로** 수행해야 한다:
+
+1. **CI Gate (BLOCKING)** — `gh pr checks <PR_NUMBER>` 전체 통과 필수. 실패 시 리뷰 중단, 워커에게 반환
+2. **Local Verification** — PR 브랜치에서 `yarn lint && yarn type-check` 실행
+3. **Diff 읽기** — `gh pr diff <PR_NUMBER>` 로 변경사항 확인. 변경 파일 기반으로 도메인별 체크리스트 생성 (보안, 접근성, 성능 등)
+4. **Code Quality Scan** — 미사용 import, `any` 타입, 누락된 에러 처리, 레이어 위반, 성능 문제 확인
+5. **Spec Compliance** — `gh issue view <ISSUE_NUMBER>` 로 수용 기준 대비 구현 확인
+6. **Test Coverage** — 새 로직에 테스트가 있는지, 엣지 케이스가 커버되는지 확인
+7. **Structured Review Comment** — `gh pr review <PR_NUMBER> --comment --body "<리뷰>"` 로 결과 게시
+
+리뷰 코멘트 형식:
+```markdown
+## Review: [APPROVE | CHANGES_REQUESTED]
+### CI Status: [PASS | FAIL]
+### Issues Found:
+- [critical]: <설명> — <file:line>
+- [high]: <설명> — <file:line>
+- [medium]: <설명> — <file:line>
+### Recommendation: [APPROVE | REQUEST_CHANGES]
 ```
-success → review_pending → review_addressed → approved
-```
 
-| Status | Meaning |
-|--------|---------|
-| `success` | PR created, review cycle starts |
-| `review_pending` | Review comments posted, awaiting worker response |
-| `review_addressed` | Worker addressed review, awaiting re-review |
-| `approved` | Final approval — truly done ✅ |
+### Trigger (taskmaestro 관점)
 
-### Trigger
+지휘자의 watch 모드는 `.taskmaestro/wt-N/RESULT.json`의 `status` 필드를 감지한다:
 
-When watch mode detects RESULT.json:
-- `status: "success"` → **start review cycle** (NOT done)
-- `status: "failure"` / `"error"` → report to user (existing behavior)
-- `status: "review_pending"` → awaiting worker response (conductor waits)
-- `status: "review_addressed"` → start re-review
-- `status: "approved"` → truly done ✅
+| `status` | 지휘자 동작 |
+|----------|-------------|
+| `success` | 리뷰 사이클 시작 (done으로 보고하지 않음) |
+| `failure` / `error` | 사용자에게 보고, 리뷰 미진행 |
+| `review_pending` | 워커 응답 대기 |
+| `review_addressed` | 재리뷰 시작 |
+| `approved` | 진짜 완료 ✅ |
 
 ### Review Routing
 
-When `status: "success"` or `status: "review_addressed"` is detected:
+- `review_pane`이 설정되지 않았으면 (기본) → **Conductor Review** 실행
+- `review_pane`이 설정되었으면 → 해당 패널의 **Review Agent**로 위임
 
-1. Check state file for `review_pane`
-2. If `review_pane` exists → delegate to **Review Agent** (see below)
-3. If no `review_pane` → **Conductor Fallback Review**
+두 경우 모두 위의 리뷰 프로토콜 7단계를 동일하게 실행한다.
 
-### Conductor Fallback Review
+**Severity 등급 (Code Review):**
+- **critical**: 보안 취약점, 인증 누락, 데이터 손실 위험, 빌드/CI 완전 파손, 프로덕션 장애 — 무조건 수정 필수, 머지 차단
+- **high**: 에러 처리 누락, 새 로직 테스트 미작성, off-by-one, `any` 타입, 레이어 위반, N+1 쿼리 — 수정 권장, 여러 개면 머지 차단
+- **medium**: 복잡도 초과, 네이밍 불일치, 문서 누락, 접근성 이슈 — 코멘트 후 승인 가능
+- **low**: 스타일 nit, 리팩토링 제안, 코멘트 문구 — 머지 차단 불가
 
-When no dedicated review pane is configured, the conductor reviews directly:
+**Approval 조건:**
+- CI 전체 통과
+- `critical` 0개
+- `high` 0개 (명시적 defer 티켓 제외)
+- 새 코드에 적절한 테스트
+- 기존 테스트 통과
 
-1. **Read PR diff**
-   ```bash
-   gh pr diff <PR_NUMBER>
-   ```
+**Commit Hygiene (리뷰 수정 시):**
+- fix 커밋을 쌓지 말고 `git commit --amend --no-edit && git push --force-with-lease` 사용
+- 예외: 리뷰어가 명시적으로 커밋 분리를 요청한 경우
 
-2. **Generate checklist** (optional — if a checklist tool is available, use it for domain-specific checks based on changed files)
+**최대 리뷰 사이클: 3회.** 3회 후에도 미해결 시 사용자에게 보고하고 리뷰 중단.
 
-3. **Post review comment**
-   ```bash
-   gh pr review <PR_NUMBER> --comment --body "<review comments>"
-   ```
+> **Conductor Review가 기본 동작인 이유:** 지휘자는 PLAN 컨텍스트를 보유하지만, 워커 리뷰어는 그렇지 않다.
 
-4. **Update RESULT.json** to `review_pending`:
-   ```json
-   { "status": "review_pending", "review_cycle": 1, "review_comments": ["unused import", "missing error handling"] }
-   ```
+### taskmaestro 고유: 파일 기반 리뷰 트리거
 
-5. **Instruct worker to address comments**
-   ```bash
-   tmux send-keys -t "$PANE" \
-     "PR #<N> has review comments. Run gh pr view <N> --comments, address each comment, push fixes, then update RESULT.json status to review_addressed." Enter
-   ```
+프로토콜의 "워커에게 리뷰 반영 지시" 단계를 taskmaestro는 **file-based trigger**로 구현한다. 긴 프롬프트를 `send-keys`로 직접 전송하면 잘릴 수 있으므로:
 
-6. **Worker responds**: fixes code → pushes → updates RESULT.json to `review_addressed`
+1. `Review Fix TASK.md`를 워커 worktree 루트(`$REPO/.taskmaestro/wt-$PANE_IDX/TASK.md`)에 작성한다. 내용은 아래 Review Fix TASK.md 템플릿을 따른다.
+2. 짧은 트리거만 `send-keys`로 전송한다:
 
-7. **Re-review**: Conductor detects `review_addressed`, reads diff again.
-   - Issues resolved → **approve** (Step 8)
-   - Issues remain → repeat from Step 3
+    ```bash
+    tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE_IDX" \
+      "Read TASK.md and execute all steps." Enter
+    ```
 
-8. **Final approval**
-   ```bash
-   gh pr review <PR_NUMBER> --approve --body "LGTM - all review comments addressed"
-   # If own PR (can't self-approve): use --comment instead
-   gh pr review <PR_NUMBER> --comment --body "✅ Review complete - all comments addressed"
-   ```
-   Update RESULT.json: `status: "approved"`
+리뷰 에이전트 패널(`$REVIEW_PANE`)에 리뷰 프롬프트를 전송할 때도 동일한 파일 기반 패턴을 사용한다.
 
-### Max Review Cycles
+#### Review Fix TASK.md 템플릿
 
-- **Maximum 3 review cycles** to prevent infinite loops
-- After 3 cycles, report to user:
-  ```
-  ⚠️ Pane N: 3 review cycles completed, unresolved issues remain.
-  PR: #<NUMBER>
-  Unresolved comments: [list]
-  Manual intervention required.
-  ```
+워커 worktree에 작성하는 `TASK.md`의 내용:
 
-### Quality Criteria for Approval
+```markdown
+# Review Fix Task
 
-- All CI checks passing (`gh pr checks <PR_NUMBER>`)
-- No unused variables/imports
-- No unhandled errors in new code
-- Test coverage maintained
+## Steps
 
----
+1. `gh pr view <PR_NUMBER> --comments` 로 리뷰 코멘트를 확인한다.
+2. 각 코멘트에 대응: 수용 시 코드 수정, 거부 시 반박 코멘트, `Resolved: ...` 회신.
+3. MANDATORY 사전 체크: `yarn prettier --write . && yarn lint --fix && yarn type-check && yarn test` — 모두 통과해야 push 한다.
+4. 커밋 위생: `git commit --amend --no-edit && git push --force-with-lease` (fix 커밋을 쌓지 말 것).
+5. `RESULT.json`을 업데이트한다: `{ "status": "review_addressed", "review_cycle": <current_cycle> }`
 
-## Review Agent Protocol
+[CONTINUOUS] DO NOT stop. Only stop AFTER updating RESULT.json to "review_addressed".
+```
 
-When `--review-pane` is enabled (default), the last worker pane is allocated as a
-dedicated review agent, separating code review concerns from the conductor.
+> **핵심:** 워커는 리뷰 반영 후 반드시 `RESULT.json`의 `status`를 `review_addressed`로 업데이트해야 watch cron이 재리뷰를 트리거한다.
 
-### Review Agent Checklist (MANDATORY ORDER)
+### taskmaestro 고유: 상태 스키마
 
-The review agent MUST follow this 6-step checklist for every PR:
+리뷰 사이클 중 각 패널의 `taskmaestro-state.json` 필드:
 
-1. **CI Gate** — `gh pr checks <PR_NUMBER>` must all pass before reviewing
-2. **Local Verification** — Checkout PR branch, run build + tests locally
-3. **Code Quality Scan** — Check for unused imports, dead code, complexity
-4. **Spec Compliance** — Does the PR match the issue requirements?
-5. **Test Coverage** — Are new code paths covered by tests?
-6. **Structured Review Comment** — Post findings via `gh pr review`
+```json
+{
+  "index": 1,
+  "role": "worker",
+  "worktree": "...",
+  "branch": "...",
+  "task": "...",
+  "status": "review_pending",
+  "result": { "...RESULT.json 내용..." },
+  "review_cycle": 1,
+  "pr_number": 42
+}
+```
 
-### Review Agent RESULT.json
-
-The review agent writes its own RESULT.json with a `review_result` field:
+리뷰 에이전트 패널은 `role: "reviewer"`, `status: "reviewing"`을 사용한다. 리뷰 에이전트의 결과 파일(`<repo>/.taskmaestro/wt-<review_pane>/RESULT.json`)은 다음 스키마를 따른다:
 
 ```json
 {
   "status": "success",
   "review_result": "approve | changes_requested",
-  "pr_number": 42,
-  "review_comments": ["unused import in line 15", "missing test for error case"],
-  "timestamp": "2026-03-28T16:00:00.000Z"
+  "issues_found": 3,
+  "critical_count": 0,
+  "high_count": 1
 }
 ```
 
-### Conductor Handling of Review Agent Result
+Severity 카운트 필드(`critical_count`, `high_count`)는 위 Review Routing 섹션의 Severity 등급을 따른다.
 
-When watch detects the review agent's RESULT.json:
+지휘자는 리뷰 에이전트 결과를 읽고:
 
-- `review_result: "approve"` → Update worker's RESULT.json to `approved`, report done
-- `review_result: "changes_requested"` → Forward comments to worker pane, update to `review_pending`
+1. `review_result: "approve"` → 워커 `RESULT.json`을 `approved`로 업데이트, 승인 코멘트 게시, 사용자에게 완료 보고
+2. `review_result: "changes_requested"` → 워커 `RESULT.json`을 `review_pending`으로 업데이트하고 `review_cycle` 증가, file-based 리뷰 수정 트리거 전송
+3. 리뷰 에이전트 `RESULT.json`을 삭제해 다음 리뷰를 위해 초기화
 
-### Review Cycle State in taskmaestro-state.json
+`status` 값 매핑:
 
-```json
-{
-  "panes": {
-    "1": { "task": "API endpoints", "status": "review_pending", "role": "worker", "review_cycle": 1 },
-    "2": { "task": "Auth feature", "status": "working", "role": "worker" },
-    "3": { "task": null, "status": "idle", "role": "reviewer" }
-  },
-  "review_pane": "3"
-}
+- `working` → 워커 작업 중
+- `reviewing` → 리뷰 에이전트가 PR 리뷰 중 (reviewer 패널 전용)
+- `review_pending` → 리뷰 코멘트 작성 완료, 워커 응답 대기
+- `review_addressed` → 워커 리뷰 반영 완료, 재리뷰 대기
+- `approved` → 최종 승인 완료 (진짜 done)
+- `done` → 리뷰 없이 완료 (failure/error)
+
+---
+
+## Merge Policy (MANDATORY)
+
+**The conductor MUST NEVER merge PRs or modify the master/main branch.**
+
+Prohibited commands:
+- `gh pr merge` (all flags: --squash, --merge, --rebase, --admin, --auto)
+- `git merge`
+- `git pull origin master` / `git pull origin main` (includes merge)
+- Any command that modifies the remote default branch
+
+Allowed:
+- `git fetch origin` (read-only)
+- `gh pr create` (create PR, not merge)
+- `gh pr view` (read-only)
+
+**Protocol:**
+1. Worker creates PR via `/ship` → reports PR URL
+2. Conductor reports PR URL to user
+3. User merges PR at their discretion
+4. User notifies conductor: "머지했음" / "merged"
+5. Conductor runs `git fetch origin` to verify, then proceeds
+
+**Wave transition:**
+- After all workers in a wave create PRs, report to user: "Wave N complete. PRs: #X, #Y, #Z. 머지 후 알려주세요."
+- Wait for user confirmation before creating next wave's worktrees
+
+---
+
+## Wave Analysis: Shared File Prediction
+
+Before assigning issues to a wave, predict the FULL file footprint per issue:
+
+1. **Explicit files**: Listed in issue body
+2. **Implicit shared files** (always check):
+   - `package.json` — dependency changes
+   - `config.schema.ts` / `*.config.*` — schema/config updates
+   - `index.ts` / barrel exports — new module exports
+   - `README.md` — documentation updates
+   - `.gitignore` — new artifacts
+3. **모듈/서비스 추가 이슈**: 설정 파일(`config.schema.ts`, `*.config.*`)을 잠재적 overlap으로 플래그
+
+### Module/Barrel 파일 — Mandatory Overlap Check
+
+새 모듈이나 핸들러를 추가하는 이슈는 반드시 다음 패턴의 파일을 수정 대상으로 플래그해야 한다:
+- barrel export 파일 (`index.ts`, `index.js`)
+- module registry 파일 (예: `app.module.ts`, `handlers/index.ts`)
+- 기존 모듈에 추가하는 경우 해당 모듈 파일
+
+Two issues touching the same barrel/module file → MUST be in different waves.
+
+**Overlap check:**
 ```
+For each pair of issues in the wave:
+  shared_files = issue_A.files ∩ issue_B.files
+  if shared_files is not empty:
+    → Move one issue to next wave OR make sequential in same pane
+```
+
+**Reference incidents:**
+- 설정 파일(config.schema.ts 등)이 이슈 본문에 명시되지 않은 채 두 이슈에서 동시 수정되어 merge conflict 발생
+- barrel export(handlers/index.ts)와 module registry 파일이 두 이슈에서 동시 수정되어 merge conflict 발생
 
 ---
 
@@ -250,22 +301,21 @@ When watch detects the review agent's RESULT.json:
 
 ### Array Indexing Ban
 
-Array indexing behaves differently between bash and zsh, causing silent bugs:
+**NEVER use array indexing in monitoring/watch scripts.** zsh is 1-indexed, bash is 0-indexed. This causes wrong issue mapping.
 
 ```bash
 # ❌ BANNED — index mismatch between shells
-# bash: arr[0] is first element
-# zsh:  arr[1] is first element (0-indexed requires setopt)
-PANES=(1 2 3)
-echo "${PANES[0]}"  # Different result in bash vs zsh!
+EXPECTED=("#888" "#811")
+echo ${EXPECTED[$IDX]}
 
 # ✅ REQUIRED — explicit key:value mapping
-PANE_1_TASK="implement API"
-PANE_2_TASK="write tests"
-# Or use associative arrays with explicit keys
+for PANE_INFO in "1:#888" "2:#811" "3:#813"; do
+  N="${PANE_INFO%%:*}"
+  EXP="${PANE_INFO##*:}"
+done
 ```
 
-**Rule:** Never use numeric array indexing in shell scripts. Use explicit variable names or associative arrays with string keys.
+**Reference incident:** zsh 1-based indexing caused pane 3 and 4's valid RESULT.json to be deleted.
 
 ---
 
@@ -273,63 +323,28 @@ PANE_2_TASK="write tests"
 
 ### Compact Cadence
 
-For long-running orchestration sessions, context can grow large. Follow these guidelines:
+For long taskMaestro sessions (multiple waves):
+- **Compact after every 2 waves** to prevent context degradation
+- **Compact before starting a new batch** of waves
+- **Save critical state** to `~/.claude/taskmaestro-state.json` before compact
+- **After compact**: re-read taskmaestro-state.json to restore wave context
 
-- **Watch mode** produces periodic status reports — keep them concise (summary table only)
-- **Conductor decisions** should be logged to `~/.claude/taskmaestro-state.json`, not kept in conversation context
-- When the conductor's context gets large, summarize completed waves and focus on the current wave
-- CronCreate jobs are tied to the current Claude Code session and auto-expire after 7 days
-- If the session ends or expires, watch mode stops — run `/taskmaestro watch` again to restart
-
----
-
-## Merge Policy (MANDATORY)
-
-The conductor must NEVER merge PRs directly. Always delegate merge to the user.
-
-**Prohibited actions:**
-- `gh pr merge` — conductor must not execute this
-- Auto-merge enablement — conductor must not enable auto-merge
-
-**Allowed actions:**
-- `gh pr review --approve` — approve after review passes
-- Report PR status to user with merge recommendation
-- User decides when and how to merge (squash, rebase, merge commit)
-
-**Rationale:** Merging is an irreversible action that affects the main branch. The conductor
-orchestrates work but does not own the merge decision. This prevents accidental merges of
-incomplete or conflicting PRs, especially during multi-wave parallel execution.
-
----
-
-## Wave Analysis: Shared File Prediction
-
-**Iron Rule:** Issues that modify the same file MUST NOT run in the same wave.
-
-Before assigning issues to parallel workers, the conductor must analyze potential file overlap:
-
-1. **Read each issue body** — extract mentioned file paths, component names, module references
-2. **Build overlap matrix** — identify shared files between issue pairs
-3. **Group into waves** — issues with zero file overlap can run in parallel (same wave), overlapping issues must be in different waves
-
+Recommended flow:
 ```
-Example:
-  Issue A: modifies src/auth/login.ts, src/auth/types.ts
-  Issue B: modifies src/api/users.ts
-  Issue C: modifies src/auth/login.ts, src/api/middleware.ts
-
-  Wave 1: [A, B]  — no overlap
-  Wave 2: [C]     — overlaps with A on login.ts
+Wave 1 → Wave 2 → compact → Wave 3 → Wave 4 → compact → ...
 ```
 
-**Why:** Parallel workers in separate worktrees create independent branches. If two workers
-modify the same file, their PRs will conflict at merge time, requiring manual resolution.
+**Warning signs** that compact is needed:
+- Session cost exceeds $2
+- Context usage exceeds 50%
+- Response quality noticeably degrading
+- Session duration exceeds 2 hours
 
 ---
 
 ## Subcommand: start
 
-`/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>] [--review-pane | --no-review-pane]`
+`/taskmaestro start [--repo <path>] [--base <branch>] [--panes <1,2,3>] [--review-pane] [--no-review-pane]`
 
 현재 세션의 기존 패널들에 worktree + Claude Code를 세팅한다.
 
@@ -338,8 +353,8 @@ modify the same file, their PRs will conflict at merge time, requiring manual re
 - `--repo`: 대상 레포 경로 (기본값: 현재 작업 디렉토리)
 - `--base`: 베이스 브랜치 (기본값: 현재 브랜치)
 - `--panes`: 사용할 패널 번호 목록 (기본값: 지휘자 패널을 제외한 모든 패널)
-- `--review-pane`: 마지막 패널을 리뷰 전용 에이전트로 할당 (기본값: enabled)
-- `--no-review-pane`: 리뷰 패널 비활성화 (모든 패널이 워커)
+- `--review-pane`: 리뷰 전용 패널 할당 (기본값: 비활성화). 활성화하려면 `--review-pane` 명시 사용
+  - **Rationale:** Conductor has PLAN context; worker reviewers do not. Conductor Review is the primary and default review method.
 
 ### Step 2: 사전 검증
 
@@ -356,6 +371,30 @@ tmux -L "$SOCKET_NAME" list-panes -t "$SESSION:$WIN_IDX" -F '#{pane_index} #{pan
 ```
 
 지휘자 패널($MY_PANE)을 제외한 패널들이 워커 대상이 된다. `--panes`로 지정하지 않으면 모든 비활성 패널을 사용한다.
+
+**리뷰 패널 할당 (`--review-pane`, 기본 비활성화):**
+`--review-pane` 플래그를 명시하면 사용 가능한 패널 중 마지막 패널을 리뷰 에이전트 전용으로 할당한다.
+기본값은 비활성화이며, 지휘자가 직접 리뷰를 수행한다 (Conductor Review).
+**Rationale:** Conductor has PLAN context; worker reviewers do not.
+
+```bash
+# 리뷰 패널 할당 (기본: 비활성화 — --review-pane 명시 시에만 활성화)
+if [ "$REVIEW_PANE_ENABLED" = true ]; then
+  REVIEW_PANE=$(echo "$AVAILABLE_PANES" | tail -1)
+  WORKER_PANES=$(echo "$AVAILABLE_PANES" | head -n -1)
+
+  # 워커 패널이 최소 1개는 있어야 함
+  if [ -z "$WORKER_PANES" ]; then
+    echo "ERROR: 리뷰 패널을 할당하면 워커 패널이 없습니다. --no-review-pane을 사용하거나 패널을 추가하세요."
+    exit 1
+  fi
+else
+  REVIEW_PANE=""
+  WORKER_PANES="$AVAILABLE_PANES"
+fi
+```
+
+> **최소 패널 요구:** `--review-pane` 사용 시 지휘자 + 워커 1개 + 리뷰어 1개 = 최소 3개 패널이 필요하다.
 
 **워커 패널이 없는 경우:** 지휘자 패널만 존재하면, 첫 번째 숫자 인수(기본값 3)만큼 새 패널을 생성한다:
 
@@ -396,8 +435,11 @@ mkdir -p "$DIR/.taskmaestro"
 # .gitignore에 .taskmaestro/ 추가
 grep -qxF '.taskmaestro/' "$DIR/.gitignore" 2>/dev/null || echo '.taskmaestro/' >> "$DIR/.gitignore"
 
-# 각 워커 패널에 대해 worktree 생성
-for PANE_IDX in $WORKER_PANES; do
+# 각 워커 패널 + 리뷰 패널에 대해 worktree 생성
+ALL_PANES="$WORKER_PANES"
+[ -n "$REVIEW_PANE" ] && ALL_PANES="$ALL_PANES $REVIEW_PANE"
+
+for PANE_IDX in $ALL_PANES; do
   BRANCH="taskmaestro/$TIMESTAMP/pane-$PANE_IDX"
   WT_PATH="$DIR/.taskmaestro/wt-$PANE_IDX"
   if [ -d "$WT_PATH" ]; then
@@ -413,25 +455,28 @@ done
 
 ### Step 4.5: Worker Pre-Flight Verification
 
-Before launching Claude Code, verify each worktree is in a clean, ready state:
+Before launching Claude Code, verify each worktree:
 
 ```bash
-for PANE_IDX in $WORKER_PANES; do
+# 워커 + 리뷰 패널 모두 사전 검증
+ALL_PANES="$WORKER_PANES"
+[ -n "$REVIEW_PANE" ] && ALL_PANES="$ALL_PANES $REVIEW_PANE"
+
+for PANE_IDX in $ALL_PANES; do
   WT_PATH="$DIR/.taskmaestro/wt-$PANE_IDX"
 
-  # 1. Remove stale artifacts from previous waves
+  # 1. Remove stale artifacts
   rm -f "$WT_PATH/RESULT.json" "$WT_PATH/TASK.md"
 
-  # 2. Copy permission presets (prevents permission prompts blocking workers)
+  # 2. Copy permission presets
   if [ -f "$REPO/.claude/settings.local.json" ]; then
     mkdir -p "$WT_PATH/.claude"
     cp "$REPO/.claude/settings.local.json" "$WT_PATH/.claude/settings.local.json"
   fi
 
-  # 3. Install dependencies (CRITICAL — without this, local CI checks fail)
+  # 3. Install dependencies (CRITICAL — without this, yarn prettier/lint/test all fail)
   echo "Installing dependencies in wt-$PANE_IDX..."
-  (cd "$WT_PATH" && yarn install --immutable 2>/dev/null) || \
-    echo "WARNING: yarn install failed in wt-$PANE_IDX"
+  (cd "$WT_PATH" && yarn install --immutable 2>/dev/null) || echo "WARNING: yarn install failed in wt-$PANE_IDX"
 
   # 4. Verify git status clean
   if ! git -C "$WT_PATH" diff --quiet 2>/dev/null; then
@@ -441,20 +486,25 @@ done
 ```
 
 This prevents:
-- Stale `RESULT.json` from previous waves being detected as "completed"
-- **Workers unable to run local CI checks** due to missing `node_modules` (root cause of repeated CI failures in worktrees)
+- Stale RESULT.json from previous waves being detected as "completed"
+- **Workers unable to run local CI checks due to missing node_modules** (root cause of repeated CI failures)
 - Permission prompt interruptions blocking worker progress
 - Dirty worktree state causing unexpected behavior
-
-> **Note:** The dependency install command (`yarn install`) should match your project's package manager. For Go projects use `go mod download`, for Python use `pip install -e .`, etc.
 
 ### Step 5: 각 패널에 Claude Code 실행
 
 ```bash
+# 워커 패널에 Claude Code 실행
 for PANE_IDX in $WORKER_PANES; do
   tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE_IDX" \
     "unset CLAUDECODE && cd $DIR/.taskmaestro/wt-$PANE_IDX && claude --dangerously-skip-permissions" Enter
 done
+
+# 리뷰 패널에 Claude Code 실행
+if [ -n "$REVIEW_PANE" ]; then
+  tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$REVIEW_PANE" \
+    "unset CLAUDECODE && cd $DIR/.taskmaestro/wt-$REVIEW_PANE && claude --dangerously-skip-permissions" Enter
+fi
 ```
 
 > **중요:** 지휘자 Claude Code 세션의 tmux 패널은 `CLAUDECODE` 환경변수를 상속받아 중첩 실행이 차단된다. `unset CLAUDECODE`로 해제해야 한다.
@@ -495,25 +545,29 @@ done
   "session": "workspace-1",
   "window_index": 0,
   "conductor_pane": 0,
+  "review_pane": 3,
   "repo": "절대경로",
   "base_branch": "브랜치",
   "created_at": "ISO timestamp",
   "watch_cron_id": null,
-  "review_pane": 3,
   "panes": [
-    {"index": 1, "worktree": "절대경로/.taskmaestro/wt-1", "branch": "taskmaestro/ts/pane-1", "task": null, "status": "idle", "role": "worker"},
-    {"index": 2, "worktree": "절대경로/.taskmaestro/wt-2", "branch": "taskmaestro/ts/pane-2", "task": null, "status": "idle", "role": "worker"},
-    {"index": 3, "worktree": "절대경로/.taskmaestro/wt-3", "branch": "taskmaestro/ts/pane-3", "task": null, "status": "idle", "role": "reviewer"}
+    {"index": 1, "role": "worker", "worktree": "절대경로/.taskmaestro/wt-1", "branch": "taskmaestro/ts/pane-1", "task": null, "status": "idle", "result": null},
+    {"index": 2, "role": "worker", "worktree": "절대경로/.taskmaestro/wt-2", "branch": "taskmaestro/ts/pane-2", "task": null, "status": "idle", "result": null},
+    {"index": 3, "role": "reviewer", "worktree": "절대경로/.taskmaestro/wt-3", "branch": "taskmaestro/ts/pane-3", "task": null, "status": "idle", "result": null}
   ]
 }
 ```
+
+- `review_pane`: 리뷰 에이전트 패널 인덱스. `--no-review-pane` 사용 시 `null`
+- `role`: 각 패널의 역할. `"worker"` 또는 `"reviewer"`
+- 리뷰 패널이 없는 경우(`review_pane: null`), 모든 패널의 `role`은 `"worker"`
 
 ### Step 8: watch 자동 시작
 
 CronCreate로 30초 주기 cron job을 생성하여 watch 모드를 자동 시작한다.
 생성된 cron job ID를 상태 파일의 `watch_cron_id`에 기록한다.
 
-프롬프트: 각 패널의 상태를 capture-pane으로 확인하고, 에러 상태 패널이 있으면 사용자에게 알린다.
+프롬프트: 각 워커 패널에 대해 **1차: RESULT.json 파일 확인 → 2차: capture-pane fallback** 순서로 상태를 감지한다. 워커의 `"success"` 감지 시 Review Routing (review_pane 존재 시 리뷰 에이전트에 위임). 리뷰 에이전트 패널의 RESULT.json도 확인하여 리뷰 결과 처리. 완료/에러 상태 패널이 있으면 사용자에게 보고한다.
 
 ### Step 9: 결과 보고
 
@@ -524,12 +578,15 @@ TaskMaestro 시작 완료!
   세션: workspace-1
   레포: /path/to/repo
   지휘자: 패널 0
-  워커: 패널 1, 2, 3
+  워커: 패널 1, 2
+  리뷰어: 패널 3
   베이스: main
 
 /taskmaestro assign <번호> "작업" 으로 작업을 배정하세요.
 /taskmaestro status 로 상태를 확인하세요.
 ```
+
+> **리뷰 패널이 없는 경우** (`--no-review-pane`): "리뷰어" 줄을 생략하고 모든 패널을 워커로 표시한다.
 
 ---
 
@@ -548,61 +605,61 @@ cat ~/.claude/taskmaestro-state.json
 소켓/세션/윈도우 정보를 가져온다.
 패널 번호가 워커 패널 목록에 포함되는지 검증한다. 지휘자 패널이거나 존재하지 않는 패널이면 에러 출력 후 중단.
 
-### Step 2: 작업 전송 (3-tier context delivery)
+### Step 2: 작업 지시 파일 작성 및 트리거 전송
 
-The conductor uses a 3-tier fallback chain to deliver task context to workers,
-solving the problem of `send-keys` truncating long prompts:
+워커에게 작업 지시와 함께 **RESULT.json 작성 지시**를 포함한 프롬프트를 **TASK.md 파일**로 전달한다.
 
-**Tier 1 (preferred): TASK.md file**
+> **중요:** 긴 프롬프트를 `send-keys`로 직접 전송하면 잘릴 수 있다. 반드시 TASK.md 파일에 작성하고 짧은 트리거만 `send-keys`로 전송한다.
 
-Write the full task directive to the worker's worktree, then send a short prompt:
+#### Step 2a: TASK.md 파일 작성
+
+워커 worktree 루트에 `TASK.md`를 작성한다:
 
 ```bash
-# Write TASK.md to worktree root
-cat > "$REPO/.taskmaestro/wt-$PANE/TASK.md" << 'TASKEOF'
-# Task: <task description>
+WT_PATH="$REPO/.taskmaestro/wt-$PANE"
 
-<full task context, acceptance criteria, file list, etc.>
+cat > "$WT_PATH/TASK.md" << 'TASKEOF'
+# Task: <작업 지시 요약>
+
+<작업 지시 전체 내용>
 
 ---
-[MANDATORY PRE-PUSH VERIFICATION]
-Before pushing, run and pass ALL checks:
-1. yarn prettier --write .
-2. yarn lint --fix
-3. yarn type-check
-4. yarn test
+[MANDATORY PR RULES]
+When creating PR with gh pr create, ALWAYS include --add-label with appropriate labels (feat, chore, fix, etc.).
 
-[COMPLETION PROTOCOL]
-When done, write RESULT.json to the worktree root with status/issue/pr_number/etc.
+[MANDATORY PRE-PUSH] yarn prettier --write . && yarn lint --fix && yarn type-check && yarn test — ALL must pass before push.
+[COMPLETION] Write RESULT.json: {"status":"success|failure|error","issue":"#NNNN","pr_number":N,"pr_url":"URL","timestamp":"ISO","cost":null,"error":null}
+[CONTINUOUS] DO NOT stop. Complete ALL steps. Only stop AFTER RESULT.json.
 TASKEOF
-
-# Send short prompt referencing TASK.md
-tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" \
-  "Read TASK.md in the current directory and execute the task described in it. Follow ALL instructions including pre-push verification and completion protocol." Enter
 ```
 
-**Tier 2 (fallback): GitHub issue reference**
+#### Step 2b: 짧은 트리거 전송
 
-When the task has a corresponding GitHub issue:
 ```bash
 tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" \
-  "Read the issue with gh issue view <NUMBER> and implement it. Write RESULT.json when done." Enter
+  "Read TASK.md and execute all steps. Follow TDD. Create PR with correct labels. Write RESULT.json when done. " Enter
 ```
 
-**Tier 3 (last resort): Inline prompt**
-
-For short, simple tasks that fit in a single send-keys:
-```bash
-tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE" "<작업 지시>" Enter
-```
-
-> **Note:** TASK.md is an ephemeral artifact — it must NEVER be committed to git.
+> **참고:** 트리거 메시지에 핵심 지시를 한 줄로 요약하여 포함한다. 상세 지시는 TASK.md에서 읽게 된다.
 
 ### Step 3: 상태 파일 업데이트
 
 해당 패널의 task와 status를 업데이트한다:
 - `task`: 작업 지시 내용
 - `status`: "working"
+
+### Worker Completion & Review Fix Protocol
+
+워커는 작업 완료 후 RESULT.json을 작성한다. 이후 리뷰 사이클이 시작되면:
+
+1. 지휘자(또는 watch cron)가 Review Fix TASK.md를 워커 worktree에 작성한다
+2. 워커는 `"Read TASK.md and execute all steps."` 트리거를 받고 TASK.md를 읽어 실행한다
+3. 워커가 리뷰 반영을 완료하면:
+   - 코드 수정 → pre-push 검증 → push
+   - **RESULT.json의 `status`를 `"review_addressed"`로 업데이트** (필수)
+4. watch cron이 `"review_addressed"`를 감지하여 재리뷰를 트리거한다
+
+> **핵심:** 워커가 리뷰 반영 후 RESULT.json을 `"review_addressed"`로 업데이트하지 않으면, watch cron이 재리뷰를 시작할 수 없다. TASK.md 템플릿에 이 지시가 포함되어 있다.
 
 ### Step 4: 결과 보고
 
@@ -661,10 +718,18 @@ for PANE_IDX in $WORKER_PANES; do
   if [ -f "$RESULT_FILE" ]; then
     STATUS=$(cat "$RESULT_FILE" | jq -r '.status')
     PR_NUMBER=$(cat "$RESULT_FILE" | jq -r '.pr_number // empty')
+    REVIEW_CYCLE=$(cat "$RESULT_FILE" | jq -r '.review_cycle // 0')
     # → status 값에 따라 적절한 상태 아이콘과 메시지 표시
   fi
 done
 ```
+
+RESULT.json이 존재하는 패널은 status 값에 따라 분기하여 표시한다:
+- `"success"` → 리뷰 대기 (PR 생성 완료)
+- `"review_pending"` → 리뷰 코멘트 작성 완료, 워커 응답 대기
+- `"review_addressed"` → 워커 리뷰 반영 완료, 재리뷰 대기
+- `"approved"` → 최종 승인 완료 (진짜 done)
+- `"failure"` / `"error"` → 실패/에러 (기존 동작)
 
 ### Step 3: capture-pane fallback (2차 감지)
 
@@ -680,49 +745,63 @@ done
 - 마지막 줄에 Claude Code 프롬프트 (`❯` 또는 `>` 로 시작하는 입력 대기) → "idle"
 - 도구 실행 중 (스피너, 코드 출력 진행 중) → "working"
 - 에러 패턴 (`Error`, `error`, `failed`, `FAIL`) → "error"
+- 프로세스 없음 (zsh 프롬프트만 보임) → "crashed"
 
-### Step 4: Cross-Validation
+### Step 4: 요약 보고
 
-RESULT.json and capture-pane MUST agree. When they conflict, flag as uncertain:
+상태 파일의 task 정보와 결합하여 테이블로 출력:
+```
+TaskMaestro 상태 (workspace-1):
 
-| RESULT.json | Pane State | Verdict |
-|-------------|------------|---------|
-| `success` | idle (❯) | ✅ Confirmed done |
-| `success` | active | ⚠️ UNCERTAIN — investigate |
-| absent | idle | Needs nudge |
-| absent | active (tokens flowing) | 🔄 Confirmed working |
-| `failure`/`error` | any | ❌ Failed/Error |
+  패널 1: ✅ approved - "API 엔드포인트 구현" → PR #42 (review complete) (worker)
+  패널 2: 🔍 reviewing - PR #43 (reviewer)
+  패널 3: 📝 review_addressed - "모듈 리팩토링" → PR #44 (awaiting re-review) (worker)
+  패널 4: 🔄 working - "인증 기능 추가" (worker)
+  패널 5: ⏳ review_pending - "캐시 레이어" → PR #45 (awaiting worker response) (worker)
+  패널 6: ❌ error - "모듈을 찾을 수 없음" (worker)
+```
 
-### Step 5: Evidence-Based Status Report
+**상태별 아이콘:**
+
+| status | 아이콘 | 설명 |
+|--------|--------|------|
+| `approved` | ✅ | 최종 승인 완료 (진짜 done) |
+| `success` (리뷰 시작 전) | 🔍 | 리뷰 사이클 진행 중 |
+| `reviewing` | 🔍 | 리뷰 에이전트가 PR 리뷰 중 (reviewer 패널 전용) |
+| `review_pending` | ⏳ | 리뷰 완료, 워커 응답 대기 |
+| `review_addressed` | 📝 | 워커 반영 완료, 재리뷰 대기 |
+| `working` | 🔄 | 작업 중 |
+| `failure` | ❌ | 작업 실패 |
+| `error` | ❌ | 예기치 못한 오류 |
+
+- `approved` 패널: RESULT.json에서 pr_url, cost, review_cycle 등을 함께 표시
+- 리뷰 진행 중 패널: PR 번호와 현재 리뷰 사이클 횟수 (N/3) 표시
+- `error`/`crashed` 패널: capture-pane 내용 마지막 10줄도 함께 표시
+
+### Status Report Format (with evidence)
 
 Every status line MUST include parenthetical evidence:
 
 ```
-TaskMaestro Status (workspace-1):
-
-  Pane 1: ✅ done - "API endpoints" → PR #42 (RESULT.json: success, pane idle ✓)
-  Pane 2: 🔄 working - "Auth feature" (active: ✽ Implementing… · ↓ 5.3k tokens)
-  Pane 3: ⚠️ uncertain - "Cache layer" (RESULT.json exists BUT pane still active)
-  Pane 4: ❌ error - "DB migration" (error in last 30 lines: "ModuleNotFoundError")
-  Pane 5: ⏸️ idle - no task assigned (❯ prompt visible, no RESULT.json)
+패널 1: ✅ approved - "task" → PR #N (RESULT.json: approved, review cycles: 2, pane idle ✓) (worker)
+패널 2: 🔄 working - "task" (active: ✽ Implementing… · ↓ 5.3k tokens) (worker)
+패널 3: 🔍 reviewing - PR #N (RESULT.json: reviewing PR #N for #M, pane active ✓) (reviewer)
+패널 4: ⏳ review_pending - "task" → PR #N (RESULT.json: review_pending, cycle 1/3, awaiting worker) (worker)
+패널 5: 📝 review_addressed - "task" → PR #N (RESULT.json: review_addressed, cycle 2/3, awaiting re-review) (worker)
+패널 6: ⚠️ uncertain - "task" (RESULT.json exists BUT pane still active — cross-verify needed) (worker)
+패널 7: ❌ error - "task" (error in last 10 lines: "ModuleNotFoundError") (worker)
 ```
-
-**Status icons:**
-
-| Status | Icon | Description |
-|--------|------|-------------|
-| done (RESULT.json success + pane idle) | ✅ | Confirmed complete |
-| working (pane active, tokens flowing) | 🔄 | Confirmed working |
-| idle (no task, ❯ prompt) | ⏸️ | Awaiting assignment |
-| error/failure | ❌ | Task failed |
-| uncertain (RESULT.json + pane active) | ⚠️ | Cross-validation conflict |
 
 **Rules:**
 - Never report bare ✅ without evidence
-- Active spinner + token flow = confirmed working
-- "thinking" alone ≠ working — check token count changes between cycles
-- Error scan depth: **30+ lines** (not just last 8)
-- RESULT.json + pane active = UNCERTAIN (investigate before reporting done)
+- RESULT.json `approved` + pane idle = confirmed done
+- RESULT.json `success` = start review cycle (NOT done)
+- RESULT.json `review_pending` = awaiting worker response
+- RESULT.json `review_addressed` = awaiting conductor re-review
+- RESULT.json + pane active = UNCERTAIN (investigate)
+- No RESULT.json + pane idle = needs nudge
+- Active spinner (… + ↓ tokens) = confirmed working
+- "thinking" alone ≠ working — check token count changes
 
 ---
 
@@ -732,36 +811,139 @@ TaskMaestro Status (workspace-1):
 
 주기적 감시 모드를 토글한다 (시작/중지).
 
-### Detection Strategy (2-tier)
+### 감지 전략 (2단계)
 
-The watch cron prompt uses a 2-tier detection strategy:
+watch 모드는 **RESULT.json 파일 기반 감지**를 1차 수단으로 사용하고, **capture-pane을 fallback**으로만 사용한다.
 
-```
-# Tier 1: Check RESULT.json in each worktree (fast, structured)
+#### 1차: RESULT.json 파일 감지 (빠르고 정확)
+
+```bash
+# 1차: 워커 패널의 RESULT.json 확인
 for PANE_IDX in $WORKER_PANES; do
   RESULT_FILE="$REPO/.taskmaestro/wt-$PANE_IDX/RESULT.json"
   if [ -f "$RESULT_FILE" ]; then
-    # Parse status and report
-    STATUS=$(jq -r '.status' "$RESULT_FILE")
+    STATUS=$(cat "$RESULT_FILE" | jq -r '.status')
     case "$STATUS" in
-      success) report "Pane $PANE_IDX: ✅ done" ;;
-      failure) report "Pane $PANE_IDX: ❌ failed" ;;
-      error)   report "Pane $PANE_IDX: ❌ error" ;;
+      "success")
+        # → Review Routing: review_pane 존재 시 리뷰 에이전트에 위임, 없으면 직접 리뷰
+        # Review Cycle Protocol 참조
+        ;;
+      "failure"|"error")
+        # → 사용자에게 에러/실패 보고 (기존 동작 유지)
+        ;;
+      "review_pending")
+        # → 워커 응답 대기 중. 지휘자는 대기한다
+        ;;
+      "review_addressed")
+        # → Review Routing: review_pane 존재 시 리뷰 에이전트에 재리뷰 위임, 없으면 직접 재리뷰
+        ;;
+      "approved")
+        # → 진짜 완료 ✅. 상태를 "done"으로 업데이트하고 사용자에게 보고
+        ;;
     esac
   fi
 done
 
-# Tier 2: capture-pane fallback for panes without RESULT.json
+# 2차: 리뷰 에이전트 패널의 RESULT.json 확인
+if [ -n "$REVIEW_PANE" ]; then
+  REVIEW_RESULT_FILE="$REPO/.taskmaestro/wt-$REVIEW_PANE/RESULT.json"
+  if [ -f "$REVIEW_RESULT_FILE" ]; then
+    REVIEW_STATUS=$(cat "$REVIEW_RESULT_FILE" | jq -r '.status')
+    REVIEW_RESULT=$(cat "$REVIEW_RESULT_FILE" | jq -r '.review_result')
+    if [ "$REVIEW_STATUS" = "success" ]; then
+      # → Conductor Handling of Review Agent Result 참조
+      # review_result에 따라 워커 PR approve 또는 changes_requested 처리
+      # 처리 후 리뷰 에이전트의 RESULT.json 삭제 (다음 리뷰 준비)
+      rm -f "$REVIEW_RESULT_FILE"
+    fi
+  fi
+fi
+```
+
+**RESULT.json status 매핑:**
+
+| status | watch 동작 |
+|--------|-----------|
+| `"success"` | 리뷰 사이클 시작 ("done"이 아님) |
+| `"failure"` / `"error"` | 사용자에게 보고 (기존 동작 유지) |
+| `"review_pending"` | 워커 응답 대기 중 |
+| `"review_addressed"` | 지휘자 재리뷰 시작 |
+| `"approved"` | 진짜 완료 ✅ |
+
+- RESULT.json이 존재하면: status 값에 따라 위 매핑대로 분기한다.
+- RESULT.json이 없으면: 아직 작업 중이거나 파일 미작성. fallback으로 진행한다.
+
+#### 2차 (fallback): capture-pane 기반 감지
+
+RESULT.json이 없는 패널에 대해서만 capture-pane으로 상태를 확인한다:
+
+```bash
 for PANE_IDX in $NO_RESULT_PANES; do
-  tmux capture-pane ... | analyze idle/working/error
+  CAPTURED=$(tmux -L "$SOCKET_NAME" capture-pane -t "$SESSION:$WIN_IDX.$PANE_IDX" -p -S -30 | tail -15)
+  # 캡처 내용 분석:
+  # - 프롬프트 대기 (❯) → "idle" (작업 완료했으나 RESULT.json 미작성)
+  # - 도구 실행 중 → "working"
+  # - 에러 패턴 → "error"
+  # - 프로세스 없음 → "crashed"
 done
 ```
 
 ### 시작 (watch_cron_id가 null인 경우)
 
 1. 상태 파일에서 정보 로드
-2. CronCreate로 30초 주기 cron job 생성:
-   - 프롬프트: 먼저 각 워커의 RESULT.json을 확인하고, 없는 패널에 대해서만 capture-pane으로 상태 확인. 에러 상태 패널이 있으면 사용자에게 알린다. Claude Code가 비정상 종료된 패널이 있으면 재시작 여부를 사용자에게 질문한다.
+2. CronCreate로 30초 주기 cron job 생성. 프롬프트에 아래 전체 로직을 포함한다:
+
+   **워커 패널 순회 (1차: RESULT.json → 2차: capture-pane fallback):**
+
+   각 워커 패널에 대해 `$REPO/.taskmaestro/wt-$PANE_IDX/RESULT.json`을 확인하고, status에 따라 분기한다:
+
+   - **`"success"` 감지 (리뷰 사이클 시작):**
+     1. 상태 파일에서 `review_pane` 확인
+     2. `review_pane` 존재 시 → Review Agent Protocol에 따라 리뷰 에이전트에 위임
+     3. `review_pane` 없으면 → Conductor Review 실행:
+        a. `gh pr diff <PR_NUMBER>` 로 PR 변경사항 읽기
+        b. 변경된 파일 기반으로 도메인별 체크리스트 생성 (보안, 접근성, 성능 등)
+        c. `gh pr review <PR_NUMBER> --comment --body "<리뷰>"` 로 리뷰 코멘트 작성
+        d. 워커의 RESULT.json 업데이트: `status: "review_pending"`, `review_cycle` 증가, `review_comments` 추가
+        e. 워커 worktree에 Review Fix TASK.md 작성 (아래 템플릿 참조):
+           ```bash
+           # Review Fix TASK.md를 워커 worktree에 작성
+           cat > "$REPO/.taskmaestro/wt-$PANE_IDX/TASK.md" << 'TASKEOF'
+           # Review Fix Task
+           ... (Review Fix TASK.md Template 참조)
+           TASKEOF
+           ```
+        f. 워커에게 짧은 트리거 전송:
+           ```bash
+           tmux -L "$SOCKET_NAME" send-keys -t "$SESSION:$WIN_IDX.$PANE_IDX" \
+             "Read TASK.md and execute all steps." Enter
+           ```
+
+   - **`"review_addressed"` 감지 (재리뷰):**
+     1. `review_cycle` 확인. 3 이상이면 사용자에게 보고하고 해당 패널 리뷰 중단
+     2. 상태 파일에서 `review_pane` 확인
+     3. `review_pane` 존재 시 → 리뷰 에이전트에 재리뷰 위임
+     4. `review_pane` 없으면 → Conductor Review 재실행:
+        a. `gh pr diff <PR_NUMBER>` 재확인
+        b. 미해결 코멘트 확인 (`gh pr view <PR_NUMBER> --comments`)
+        c. 충분히 개선 → `status: "approved"`, PR approve 코멘트 작성, 사용자에게 완료 보고
+        d. 아직 부족 → 새 리뷰 코멘트 작성 후 Review Fix TASK.md를 다시 워커에게 전달
+
+   - **`"approved"` 감지:** 진짜 완료 ✅. 상태를 "done"으로 업데이트하고 사용자에게 보고
+   - **`"failure"` / `"error"` 감지:** 사용자에게 에러/실패 보고 (기존 동작 유지)
+   - **`"review_pending"` 감지:** 워커 응답 대기 중. 지휘자는 대기한다
+
+   **리뷰 에이전트 패널 확인 (review_pane이 설정된 경우):**
+
+   `$REPO/.taskmaestro/wt-$REVIEW_PANE/RESULT.json` 확인:
+   - `review_result: "approve"` → 워커의 RESULT.json을 `status: "approved"`로 업데이트, PR approve 코멘트 작성, 리뷰 에이전트 RESULT.json 삭제
+   - `review_result: "changes_requested"` → 워커의 RESULT.json을 `status: "review_pending"`으로 업데이트 (`review_cycle` 증가), 워커 worktree에 Review Fix TASK.md 작성, 워커에게 `"Read TASK.md and execute all steps."` 트리거 전송, 리뷰 에이전트 RESULT.json 삭제
+
+   **Fallback (RESULT.json 없는 패널):**
+
+   capture-pane으로 상태 확인. idle인데 status가 "working"이면 Auto-Nudge Protocol 실행.
+   Claude Code가 비정상 종료된 패널이 있으면 재시작 여부를 사용자에게 질문한다.
+
 3. cron job ID를 상태 파일의 `watch_cron_id`에 기록
 4. 보고: "Watch 모드를 시작합니다 (30초 주기). 중지하려면 `/taskmaestro watch`를 다시 실행하세요."
 
@@ -774,35 +956,22 @@ done
 
 ### Auto-Nudge Protocol
 
-When a pane is detected as idle (❯ prompt visible) but its task status is "working",
-the watch loop automatically prods the worker back into action using escalating levels:
+When a pane is detected as idle (❯ prompt visible) but its task status is "working":
 
-| Nudge # | Action | Message |
-|---------|--------|---------|
-| 1 | Gentle continue | `send-keys "continue" Enter` |
-| 2 | Specific continue | `send-keys "continue with the next incomplete task" Enter` |
-| 3+ | Explicit instruction | Send full task context with specific next step |
+1. **First idle detection**: Send `tmux send-keys "continue" Enter`
+2. **Second consecutive idle**: Send `tmux send-keys "continue with the next incomplete task" Enter`
+3. **Third consecutive idle**: Send explicit instruction with task context
+4. **Track nudge count** per pane in the watch report
 
-Implementation in the watch cron prompt:
-
+Include in watch cron prompt:
 ```
-For each pane where status == "working":
-  Check if idle (❯ prompt visible via capture-pane)
-  If idle:
-    nudge_count[pane] += 1
-    if nudge_count <= 1:
-      send-keys "continue" Enter
-    elif nudge_count == 2:
-      send-keys "continue with the next incomplete task" Enter
-    else:
-      send-keys with explicit instruction including task context from state file
-    Report: "Pane N: IDLE → auto-nudged (#count)"
-  Else:
-    nudge_count[pane] = 0  # Reset on active detection
+If pane is idle (❯ visible) and status is "working":
+  nudge_count[pane] += 1
+  if nudge_count <= 1: send "continue"
+  elif nudge_count == 2: send "continue with the next incomplete task"
+  else: send explicit instruction
+  Report: "Pane N: IDLE → auto-nudged (#count)"
 ```
-
-**Stall detection:** A pane is considered stalled if idle for 3+ consecutive watch cycles (90s+).
-After 3 nudges with no response, report to user for manual intervention.
 
 ### 제한 사항
 
